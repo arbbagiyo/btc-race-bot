@@ -1,286 +1,215 @@
-// Mean-reversion dip-buying bot for agent-fun/bars-replay/v1.
+// Dip-scalp BTC trading bot for make.fun's btc-race-24h-20261117-0603.
 //
-// The bot trades one symbol (CBBTC/USDC) on 1-minute bars. Every batch carries
-// the bar that just closed plus the fills of the orders decided on the previous
-// batch and the current account; the bot answers each batch with at most one
-// order, filled at the next bar's open. All decisions are pure functions of the
-// bars seen so far: no clock, no network, no randomness, so two runs agree.
+// Protocol agent-fun/bars-replay/v1: the harness sends hello once, then one
+// batch per bar. Each batch carries the bar that just closed, the fills of the
+// orders decided on the previous batch, and the account. This bot answers
+// every batch with exactly one reply echoing its seq, carrying zero or one
+// order. Orders decided on a batch fill at the next bar's open.
 //
-// Strategy: buy deep dips, exit on recovery or on protection.
-//   Entry (flat only): either the close sits far below its 240-bar Bollinger
-//   mean (z <= -2.5) with RSI(14) oversold (<= 40), or the close has fallen
-//   1.5% or more below the highest close of the last 480 bars with RSI <= 50.
-//   Both need a regime filter (the close must not sit more than 2% below its
-//   240-bar EMA, so the bot never buys into a strong downtrend) and a one-bar
-//   bounce confirmation (this close above the previous close).
-//   Exit (long only): take profit at +1.6% over the average fill price, stop
-//   loss at -1.0%, or a 480-bar maximum hold, whichever comes first. After a
-//   sell the bot waits 15 bars before it may buy again.
-//   Fallback: a window with no deep dip would leave the bot with no trade at
-//   all, which fails the guardrails. If nothing has ever filled by bar 1080
-//   of the 1440-bar window and the close holds above its long EMA with RSI
-//   under 65, the bot buys once with the same exits; from bar 1320 it buys at
-//   half size on any RSI under 80 rather than finish with no trade. The dev
-//   window trades long before bar 1080, so the fallback never fires there.
-//   Size: the whole cash balance, capped so the order's own price impact on
-//   the latest close's pool depth stays under 20 bps, and capped by the
-//   position-weight room the harness reports. Every order names
-//   max_slippage_bps 100 against the latest close.
+// Strategy: buy deep dips, exit on take-profit / stop-loss / maximum hold.
+// A dip counts when ANY of these fires on the latest bar:
+//   - Bollinger z-score: close 1.1 std below the 90-bar mean,
+//   - confirmed bounce: the 30-bar z-score dipped below -1.3 within the last
+//     8 bars and the last 5 bars already bounced 43 bps,
+//   - drawdown: close 202 bps below the 480-bar rolling high.
+// Every entry must also pass all gates: RSI(7) at or below 41, close within
+// 87 bps below the 240-bar EMA (no strong downtrend), and at most 3 flat bars
+// in the last 60 (no chop). Exits: +185 bps take-profit, -182 bps stop-loss,
+// or 720 bars held. 30-bar cooldown after each exit. Size 99.5% of cash,
+// capped so own impact on the latest close's depth stays under 30 bps.
+//
+// All decisions use only past bars. No clock, no network, no files, no
+// randomness: the same bars always produce the same orders.
 
 import { runBars } from './vendor/makefun-bars.ts';
-import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
+import type { Batch, OrderInput } from './vendor/makefun-bars.ts';
 
-// ------------------------------------------------------------------ parameters
+const SYMBOL = 'CBBTC';
 
-/** Bollinger window (bars) for the mean and standard deviation of closes. */
-const BB_N = 240;
-/** RSI period (Wilder smoothing). */
-const RSI_N = 14;
-/** EMA window (bars) for the regime filter. */
-const EMA_N = 240;
-/** Rolling-high window (bars) for the drawdown entry. */
-const DROP_W = 480;
-/** Drawdown from the rolling high that counts as a deep dip. */
-const DROP_PCT = 0.015;
-/** Bollinger z-score that counts as oversold. */
-const Z_ENTRY = -2.5;
-/** RSI ceiling for the Bollinger entry. */
-const RSI_ENTRY = 40;
-/** RSI ceiling for the drawdown entry (looser: the drop itself is the signal). */
-const RSI_ENTRY_DROP = 50;
-/** Regime filter: never buy more than this far below the long EMA. */
-const REGIME_TOL = 0.02;
-/** Take profit over the average fill price. */
-const TAKE_PROFIT = 0.016;
-/** Stop loss under the average fill price. */
-const STOP_LOSS = 0.01;
-/** Longest hold, in bars, before a forced exit. */
-const MAX_HOLD = 480;
-/** Bars to wait after a sell before the next buy. */
-const COOLDOWN = 15;
-/** Slippage cap on every order, in bps from the latest close. */
-const MAX_SLIPPAGE_BPS = 100;
-/** Size cap: keep the order's own impact on the close depth under this, bps. */
-const IMPACT_CAP_BPS = 20n;
-/** First bar at which the no-trade fallback may buy (windows are 1440 bars). */
-const LATE_BAR = 1080;
-/** First bar at which the last-resort half-size fallback may buy. */
-const LAST_RESORT_BAR = 1320;
+const CFG = {
+  bollN: 90,
+  bollZ: 1.1,
+  bounceN: 30,
+  bounceZ: 1.3,
+  bounceW: 8,
+  bounceMomK: 5,
+  bounceMomBps: 43,
+  ddWin: 480,
+  ddDipBps: 202,
+  rsiPeriod: 7,
+  rsiMax: 41,
+  emaWin: 240,
+  emaFilterBps: 87,
+  flatWin: 60,
+  flatMax: 3,
+  tpBps: 185,
+  slBps: 182,
+  holdBars: 720,
+  cooldownBars: 30,
+  warmBars: 30,
+  sizeNum: 995n,
+  sizeDen: 1000n,
+  impactCapBps: 30n,
+  slipBps: 100,
+  minNotional: 1000000n,
+};
 
-// ------------------------------------------------------------------ state
+// ---- streaming bar history (closes in USDC, floats) ----
+const closes: number[] = [];
+const flatFlags: boolean[] = [];
+const cDepths: bigint[] = [];
 
-interface BotState {
-  symbol: string;
-  priceScale: number;
-  qtyScale: number;
-  quoteScale: number;
-  /** Closes in USDC, in bar order. */
-  closes: number[];
-  /** Close time of the last bar folded in, to ignore duplicates. */
-  lastT: number;
-  /** Wilder RSI running gains/losses and the current RSI value, when defined. */
-  rsiGain: number;
-  rsiLoss: number;
-  rsi: number | null;
-  /** Long EMA of closes, seeded at the first close. */
-  ema: number | null;
-  /** Average fill price of the open position (USDC), and its quantity. */
-  entryPrice: number | null;
-  entryQty: bigint;
-  /** Batch seq at which the position opened (for the maximum hold). */
-  entrySeq: number;
-  /** No buy before this batch seq (cooldown after a sell). */
-  cooldownUntil: number;
-  /** True once any order has ever filled (the fallback needs it). */
-  everTraded: boolean;
+// ---- streaming indicators (Wilder RSI, EMA) ----
+let rsiGain = 0;
+let rsiLoss = 0;
+let ema = 0;
+
+function rsiNow(idx: number): number {
+  if (idx < CFG.rsiPeriod) return 50;
+  if (rsiLoss === 0) return 100;
+  return 100 - 100 / (1 + rsiGain / rsiLoss);
 }
 
-function newBotState(state: BarsState): BotState {
-  const first = state.hello.symbols[0];
-  return {
-    symbol: first.symbol,
-    priceScale: first.price_scale,
-    qtyScale: first.qty_scale,
-    quoteScale: state.hello.capital.quote_scale,
-    closes: [],
-    lastT: -1,
-    rsiGain: 0,
-    rsiLoss: 0,
-    rsi: null,
-    ema: null,
-    entryPrice: null,
-    entryQty: 0n,
-    entrySeq: -1,
-    cooldownUntil: -1,
-    everTraded: false,
-  };
+function meanStd(n: number, idx: number): { mean: number; std: number } {
+  const lo = Math.max(0, idx - n + 1);
+  let s = 0;
+  for (let j = lo; j <= idx; j++) s += closes[j]!;
+  const k = idx - lo + 1;
+  const mean = s / k;
+  let v = 0;
+  for (let j = lo; j <= idx; j++) { const d = closes[j]! - mean; v += d * d; }
+  return { mean, std: Math.sqrt(v / k) };
 }
 
-/** Fold one fresh close into the running indicators. */
-function observeClose(bot: BotState, close: number): void {
-  const prev = bot.closes.length > 0 ? bot.closes[bot.closes.length - 1] : null;
-  bot.closes.push(close);
-  if (prev !== null) {
-    const ch = close - prev;
-    if (bot.closes.length === 2) {
-      bot.rsiGain = Math.max(ch, 0);
-      bot.rsiLoss = Math.max(-ch, 0);
-    } else {
-      bot.rsiGain = (bot.rsiGain * (RSI_N - 1) + Math.max(ch, 0)) / RSI_N;
-      bot.rsiLoss = (bot.rsiLoss * (RSI_N - 1) + Math.max(-ch, 0)) / RSI_N;
-    }
-    if (bot.closes.length > RSI_N) {
-      bot.rsi = bot.rsiLoss === 0 ? 100 : 100 - 100 / (1 + bot.rsiGain / bot.rsiLoss);
-    }
-  }
-  const k = 2 / (EMA_N + 1);
-  bot.ema = bot.ema === null ? close : close * k + bot.ema * (1 - k);
+function rollHigh(n: number, idx: number): number {
+  let m = -Infinity;
+  for (let j = Math.max(0, idx - n + 1); j <= idx; j++) m = Math.max(m, closes[j]!);
+  return m;
 }
 
-/** Mean and population standard deviation of the last `n` closes. */
-function meanAndSd(closes: number[], n: number): { mean: number; sd: number } {
-  const start = closes.length - n;
-  let sum = 0;
-  for (let i = start; i < closes.length; i++) sum += closes[i];
-  const mean = sum / n;
-  let sq = 0;
-  for (let i = start; i < closes.length; i++) {
-    const d = closes[i] - mean;
-    sq += d * d;
-  }
-  return { mean, sd: Math.sqrt(sq / n) };
+// ---- position state, rebuilt from the fills each batch carries ----
+let posQty = 0n;
+let posAvgNum = 0n; // sum of fill qty * fill price (price-scale units)
+let entryBar = -1;
+let peak = 0;
+let cooldownUntil = -1;
+
+function avgPrice(): number {
+  if (posQty === 0n) return 0;
+  return Number(posAvgNum / posQty) / 1e5;
 }
 
-/** Highest close of the last `n` closes. */
-function rollingHigh(closes: number[], n: number): number {
-  let high = -Infinity;
-  for (let i = closes.length - n; i < closes.length; i++) {
-    if (closes[i] > high) high = closes[i];
-  }
-  return high;
-}
-
-// ------------------------------------------------------------------ decisions
-
-/** The bot's own state, created from hello before the first batch. */
-let bot: BotState | null = null;
-
-function onBatch(state: BarsState, batch: Batch): OrderInput[] {
-  if (bot === null) return [];
-  const sym = bot.symbol;
-
-  // Fold the fills of the orders decided on the previous batch: they tell us
-  // the average price the open position was filled at.
-  for (const fill of batch.fills) {
-    if (fill.symbol !== sym || fill.status !== 'filled') continue;
-    bot.everTraded = true;
-    const qty = BigInt(fill.qty);
-    const price = Number(fill.price) / 10 ** bot.priceScale;
-    if (fill.side === 'buy') {
-      const total = bot.entryQty + qty;
-      bot.entryPrice =
-        bot.entryPrice === null || bot.entryQty === 0n
-          ? price
-          : (bot.entryPrice * Number(bot.entryQty) + price * Number(qty)) / Number(total);
-      bot.entryQty = total;
-      bot.entrySeq = batch.seq;
-    } else {
-      bot.entryQty -= qty;
-      if (bot.entryQty <= 0n) {
-        bot.entryQty = 0n;
-        bot.entryPrice = null;
+await runBars({
+  onBatch(state, batch: Batch): OrderInput[] {
+    // 1. Fold the new bar into history (a batch may carry no bar on a gap minute).
+    const bar = batch.bars.find((b) => b.symbol === SYMBOL);
+    let idx = closes.length - 1;
+    if (bar !== undefined) {
+      const close = Number(bar.c) / 1e5;
+      closes.push(close);
+      flatFlags.push(bar.o === bar.h && bar.h === bar.l && bar.l === bar.c);
+      cDepths.push(BigInt(bar.c_depth[0]!));
+      idx = closes.length - 1;
+      if (idx === 0) {
+        ema = close;
+      } else {
+        const d = close - closes[idx - 1]!;
+        const up = Math.max(0, d);
+        const dn = Math.max(0, -d);
+        const p = CFG.rsiPeriod;
+        if (idx <= p) {
+          rsiGain += up;
+          rsiLoss += dn;
+          if (idx === p) { rsiGain /= p; rsiLoss /= p; }
+        } else {
+          rsiGain = (rsiGain * (p - 1) + up) / p;
+          rsiLoss = (rsiLoss * (p - 1) + dn) / p;
+        }
+        const k = 2 / (CFG.emaWin + 1);
+        ema = close * k + ema * (1 - k);
       }
     }
-  }
 
-  // Fold the fresh bar, if this batch carries one for our symbol. A minute the
-  // recorder missed has no bar: nothing new to decide on.
-  const bar = batch.bars.find((b) => b.symbol === sym);
-  if (bar === undefined || bar.t <= bot.lastT) return [];
-  bot.lastT = bar.t;
-  const close = Number(bar.c) / 10 ** bot.priceScale;
-  observeClose(bot, close);
-
-  if (state.warmingUp) return [];
-
-  const held = state.positions.get(sym);
-  const heldQty = held === undefined ? 0n : held.qty;
-
-  // --- long: take profit, stop loss, or maximum hold ---
-  if (heldQty > 0n) {
-    let entry = bot.entryPrice;
-    if (entry === null && held !== undefined && held.qty > 0n) {
-      // Fallback: the cost basis the account reports (fees included).
-      entry =
-        (Number(held.cost) / 10 ** bot.quoteScale) / (Number(held.qty) / 10 ** bot.qtyScale);
+    // 2. Fold the fills: rebuild the position from what actually filled.
+    for (const f of batch.fills) {
+      if (f.symbol !== SYMBOL || f.status !== 'filled') continue;
+      if (f.side === 'buy') {
+        const q = BigInt(f.qty);
+        const p = BigInt(f.price);
+        posQty += q;
+        posAvgNum += q * p;
+        entryBar = idx;
+        peak = Number(p) / 1e5;
+      } else {
+        const q = BigInt(f.qty);
+        if (q >= posQty) {
+          posQty = 0n;
+          posAvgNum = 0n;
+          entryBar = -1;
+          cooldownUntil = idx + CFG.cooldownBars;
+        } else {
+          posAvgNum = (posAvgNum * (posQty - q)) / posQty;
+          posQty -= q;
+        }
+      }
     }
-    if (entry === null || entry <= 0) return [];
-    const ret = close / entry - 1;
-    const barsHeld = batch.seq - bot.entrySeq;
-    if (ret >= TAKE_PROFIT || ret <= -STOP_LOSS || barsHeld >= MAX_HOLD) {
-      bot.cooldownUntil = batch.seq + COOLDOWN;
-      return [{ side: 'sell', symbol: sym, qty: heldQty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    // Safety: if the harness account says flat, drop any stale tracking.
+    const held = state.positions.get(SYMBOL);
+    if ((held === undefined || held.qty === 0n) && posQty !== 0n) {
+      posQty = 0n;
+      posAvgNum = 0n;
+      entryBar = -1;
     }
-    return [];
-  }
 
-  // Position empty but the tracker disagrees: resync from the account.
-  bot.entryPrice = null;
-  bot.entryQty = 0n;
+    // 3. No decisions without a fresh bar, or while the harness warms up.
+    if (bar === undefined || state.warmingUp) return [];
+    const close = closes[idx]!;
 
-  // --- flat: dip-buying entries, plus the late no-trade fallback ---
-  if (batch.seq < bot.cooldownUntil) return [];
-  if (bot.closes.length <= BB_N) return [];
-  if (bot.rsi === null || bot.ema === null) return [];
-  const prevClose = bot.closes[bot.closes.length - 2];
-  const { mean, sd } = meanAndSd(bot.closes, BB_N);
-  const z = sd > 0 ? (close - mean) / sd : 0;
-  const drop =
-    bot.closes.length >= DROP_W ? rollingHigh(bot.closes, DROP_W) / close - 1 : 0;
-  const bollingerDip = z <= Z_ENTRY && bot.rsi <= RSI_ENTRY;
-  const drawdownDip = drop >= DROP_PCT && bot.rsi <= RSI_ENTRY_DROP;
-  const regimeOk = close >= bot.ema * (1 - REGIME_TOL);
-  const bounced = close > prevClose;
-  // Size fraction in bps: 10000 for a dip or a trend-aligned late buy, 5000
-  // for the last-resort buy, 0 for no trade.
-  let sizeFracBps = 0;
-  if ((bollingerDip || drawdownDip) && regimeOk && bounced) {
-    sizeFracBps = 10000;
-  } else if (!bot.everTraded && batch.seq >= LATE_BAR) {
-    if (close >= bot.ema * 0.995 && bot.rsi <= 65) {
-      sizeFracBps = 10000;
-    } else if (batch.seq >= LAST_RESORT_BAR && bot.rsi <= 80) {
-      sizeFracBps = 5000;
+    // 4. Long: exits only.
+    if (posQty > 0n) {
+      if (close > peak) peak = close;
+      const gainBps = (close / avgPrice() - 1) * 1e4;
+      const heldBars = idx - entryBar;
+      if (gainBps <= -CFG.slBps || gainBps >= CFG.tpBps || heldBars >= CFG.holdBars) {
+        return [{ side: 'sell', symbol: SYMBOL, qty: posQty, max_slippage_bps: CFG.slipBps }];
+      }
+      return [];
     }
-  }
-  if (sizeFracBps === 0) return [];
 
-  // Size: the fraction of cash, capped by the weight room and by the pool
-  // depth at the latest close, so the order's own impact stays under the cap.
-  let size = (state.cash * BigInt(sizeFracBps)) / 10000n;
-  const room = state.weightRoom(sym);
-  if (room < size) size = room;
-  const depth = state.depthAt(sym);
-  if (depth !== null) {
-    for (const d of depth) {
-      const cap = (d * IMPACT_CAP_BPS) / 10000n;
-      if (cap < size) size = cap;
+    // 5. Flat: entries, after warm-up and cooldown.
+    if (idx < CFG.warmBars || idx < cooldownUntil) return [];
+    let signal = false;
+    const ms = meanStd(CFG.bollN, idx);
+    if (ms.std > 0 && (close - ms.mean) / ms.std <= -CFG.bollZ) signal = true;
+    if (!signal) {
+      let minZ = Infinity;
+      for (let j = Math.max(0, idx - CFG.bounceW + 1); j <= idx; j++) {
+        const m = meanStd(CFG.bounceN, j);
+        if (m.std > 0) minZ = Math.min(minZ, (closes[j]! - m.mean) / m.std);
+      }
+      if (
+        minZ <= -CFG.bounceZ &&
+        idx >= CFG.bounceMomK &&
+        (close / closes[idx - CFG.bounceMomK]! - 1) * 1e4 >= CFG.bounceMomBps
+      ) signal = true;
     }
-  }
-  const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
-  if (size < minNotional) return [];
-  return [{ side: 'buy', symbol: sym, notional_quote_units: size, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-}
+    if (!signal && close <= rollHigh(CFG.ddWin, idx) * (1 - CFG.ddDipBps / 1e4)) signal = true;
+    if (!signal) return [];
 
-async function main(): Promise<void> {
-  await runBars({
-    onHello(state: BarsState): void {
-      bot = newBotState(state);
-    },
-    onBatch(state: BarsState, batch: Batch): OrderInput[] {
-      return onBatch(state, batch);
-    },
-  });
-}
+    // Gates: weak RSI, no strong downtrend, no flat chop.
+    if (rsiNow(idx) > CFG.rsiMax) return [];
+    if (close < ema * (1 - CFG.emaFilterBps / 1e4)) return [];
+    let flats = 0;
+    for (let j = Math.max(0, idx - CFG.flatWin + 1); j <= idx; j++) if (flatFlags[j]) flats++;
+    if (flats > CFG.flatMax) return [];
 
-await main();
+    // Size: 99.5% of cash, capped by own impact on the latest close's depth.
+    // (The next bar's open depth is unknown when deciding; the latest close's
+    // depth, a minute earlier, is the best estimate the protocol gives us.)
+    let spend = (state.cash * CFG.sizeNum) / CFG.sizeDen;
+    const cap = (cDepths[idx]! * CFG.impactCapBps) / 10000n;
+    if (spend > cap) spend = cap;
+    if (spend < CFG.minNotional) return [];
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: CFG.slipBps }];
+  },
+});
